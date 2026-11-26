@@ -1,9 +1,10 @@
-import { chromium, type Page } from 'playwright';
+import { chromium, type Locator, type Page } from 'playwright';
 import { parseCalendarHtml } from './parser.js';
 
 export const SOURCE_URL =
   'https://www.koreanair.com/booking/book-and-manage/award-seat-availability';
-// Observed in the browser on 2026-09-07. Only observe the UI's response; never replay it.
+// Observed in the browser on 2026-09-07 and again on 2026-11-26. Only observe the
+// UI's response; never replay it.
 const OBSERVED_RESPONSE_PATH = '/api/hmp/bonusSeatView/bonusSeatView';
 const FILTER_LABELS = [
   '일반석 보너스',
@@ -22,8 +23,10 @@ export class CollectionError extends Error {
 }
 
 export function parseSourceUpdatedAt(text: string): string | null {
+  // Renewed wording (2026-11-26): "좌석 현황은 한국 시간 2026년 11월 26일 01:30 기준 정보로 …"
+  // Legacy wording: "좌석 상황은 대한민국 시간(2026년 9월 7일 08:00) 기준 …"
   const match = text.match(
-    /좌석 상황은 대한민국 시간\((\d{4})년 (\d{1,2})월 (\d{1,2})일 (\d{2}):(\d{2})\) 기준/,
+    /좌석 (?:현황|상황)은 (?:한국|대한민국) 시간 ?\(?(\d{4})년 (\d{1,2})월 (\d{1,2})일 (\d{2}):(\d{2})\)? ?기준/u,
   );
   if (!match) return null;
   const [, year, month, day, hour, minute] = match;
@@ -61,6 +64,38 @@ async function checkRestriction(page: Page, blockedStatus: number | null): Promi
   }
 }
 
+/**
+ * Click a control the way a person does. The renewed booking UI renders its buttons
+ * as KDS web components whose host can refuse a normal pointer click as covered by
+ * its own shadow button; the fallback re-sends the same pointer click at the
+ * element's center with hit-target checks skipped, never a script-dispatched event.
+ */
+async function clickFirst(locators: Locator[], description: string): Promise<void> {
+  let clicked = false;
+  let lastError: unknown;
+  for (const locator of locators) {
+    if (await locator.count() === 0) continue;
+    const target = locator.first();
+    try {
+      await target.click({ timeout: 10_000 });
+      clicked = true;
+      break;
+    } catch (error) {
+      lastError = error;
+      try {
+        await target.click({ force: true, timeout: 10_000 });
+        clicked = true;
+        break;
+      } catch (forcedError) {
+        lastError = forcedError;
+      }
+    }
+  }
+  if (!clicked) {
+    throw new CollectionError('STRUCTURE_CHANGED', `${description} 컨트롤을 찾아 조작하지 못했습니다: ${String(lastError)}`);
+  }
+}
+
 function describeResponse(value: unknown) {
   const root = value as { flightList?: { flightDetailList?: Record<string, unknown>[] }[] };
   const dates = Array.isArray(root?.flightList) ? root.flightList : [];
@@ -78,6 +113,45 @@ function describeResponse(value: unknown) {
   };
 }
 
+/**
+ * The renewed result renders route codes and the selected month inside KDS shadow
+ * roots, which `outerHTML` does not serialize. This wrapper carries those two values
+ * read from the live page next to the untouched table and legend markup, so the
+ * parser can verify route and month from the same document it parses.
+ */
+async function captureRenewedCalendar(page: Page): Promise<string> {
+  return page.evaluate(() => {
+    const escapeHtml = (value: string): string => value.replace(/[&<>"]/g, (character) => {
+      switch (character) {
+        case '&': return '&amp;';
+        case '<': return '&lt;';
+        case '>': return '&gt;';
+        default: return '&quot;';
+      }
+    });
+    const table = document.querySelector('#bonusCalendarTableWrapEl');
+    if (!table) return '';
+    const title = [...document.querySelectorAll('h1')]
+      .find((heading) => (heading.textContent ?? '').trim() === '보너스 좌석 상황');
+    const itinerary = document.querySelector('kds-itinerary_1');
+    const codes = itinerary?.shadowRoot
+      ? [...itinerary.shadowRoot.querySelectorAll('em.ui-itinerary__airport-code-tag')]
+        .map((code) => (code.textContent ?? '').trim())
+      : [];
+    const monthHost = document.querySelector('kds-menu-button_1');
+    const monthLabel = monthHost?.shadowRoot
+      ?.querySelector('button span:not(._hidden)')?.textContent?.trim() ?? '';
+    const legends = document.querySelector('.bonus-calendar__legends-box');
+    return '<div data-milemap-capture="renewed-1">'
+      + `<h1>${escapeHtml((title?.textContent ?? '').trim())}</h1>`
+      + `<p data-milemap-itinerary>${codes.map((code) => `<em>${escapeHtml(code)}</em>`).join('')}</p>`
+      + `<p data-milemap-month-label>${escapeHtml(monthLabel)}</p>`
+      + table.outerHTML
+      + (legends ? legends.outerHTML : '')
+      + '</div>';
+  });
+}
+
 export interface CollectionOptions {
   origin?: string;
   destination?: string;
@@ -91,11 +165,21 @@ export function validateRoute(origin: string, destination: string): void {
   }
 }
 
+async function launchBrowser(headless: boolean) {
+  try {
+    // A locally installed Chrome is the verified study browser.
+    return await chromium.launch({ channel: 'chrome', headless });
+  } catch (error) {
+    // The collector container installs Playwright's bundled Chromium only.
+    return await chromium.launch({ headless });
+  }
+}
+
 export async function collectMonth(month: string, headless = false, options: CollectionOptions = {}) {
   validateFutureMonth(month);
   const { origin = 'ICN', destination = 'JFK', captureArtifacts = true } = options;
   validateRoute(origin, destination);
-  const browser = await chromium.launch({ channel: 'chrome', headless });
+  const browser = await launchBrowser(headless);
   const context = await browser.newContext({
     locale: 'ko-KR', timezoneId: 'Asia/Seoul', viewport: { width: 1440, height: 1100 },
   });
@@ -116,35 +200,53 @@ export async function collectMonth(month: string, headless = false, options: Col
   try {
     await page.goto(SOURCE_URL, { waitUntil: 'domcontentloaded', timeout: 45_000 });
     await checkRestriction(page, blockedStatus);
-    await page.locator('#bonusTripTypeLabel_OW').waitFor({ state: 'attached', timeout: 30_000 });
+    const oneWayRadio = page.getByRole('radio', { name: '편도', exact: true });
+    await oneWayRadio.or(page.locator('#bonusTripTypeLabel_OW')).first().waitFor({ state: 'visible', timeout: 30_000 });
     const consent = page.getByRole('button', { name: '필수 쿠키만 허용', exact: true });
     try {
       await consent.waitFor({ state: 'visible', timeout: 8_000 });
       await consent.click();
     } catch (error) {
       // Some regions do not present this banner. Continue only with an accessible form.
-      if (!(await page.getByRole('radio', { name: '편도', exact: true }).isVisible())) throw error;
+      if (!(await oneWayRadio.isVisible())) throw error;
     }
     await checkRestriction(page, blockedStatus);
     const sourceUpdatedAt = parseSourceUpdatedAt(await page.locator('body').innerText());
-    await page.locator('#bonusTripTypeLabel_OW').click();
-    if (!(await page.locator('#bonusTripType_OW').isChecked())) {
+
+    // Trip type: renewed UI uses KDS chip radios; the legacy UI exposed these ids.
+    await clickFirst(
+      [oneWayRadio, page.locator('#bonusTripTypeLabel_OW')],
+      '편도 선택',
+    );
+    const oneWayChecked = await oneWayRadio.isChecked()
+      .catch(() => page.locator('#bonusTripType_OW').isChecked());
+    if (!oneWayChecked) {
       throw new CollectionError('STRUCTURE_CHANGED', '편도 선택 상태를 확인하지 못했습니다.');
     }
-    await page.getByRole('button', { name: 'From 출발지', exact: true }).click();
+
+    await clickFirst([page.getByRole('button', { name: 'From 출발지', exact: true })], '출발지 선택');
     // The observed autocomplete requires per-key events; fill alone did not show
     // candidates. Preserve the verified UI entry method for every airport code.
     await page.getByRole('combobox', { name: '출발지 검색', exact: true }).pressSequentially(origin, { delay: 60 });
-    await page.getByRole('option', { name: new RegExp(`^${origin}\\b`, 'u') }).click();
+    await clickFirst([page.getByRole('option', { name: new RegExp(`\\b${origin}\\b`, 'u') })], `${origin} 출발지 옵션`);
     await checkRestriction(page, blockedStatus);
-    await page.getByRole('button', { name: 'To 도착지', exact: true }).click();
+
+    await clickFirst([page.getByRole('button', { name: 'To 도착지', exact: true })], '도착지 선택');
     await page.getByRole('combobox', { name: '도착지 검색', exact: true }).pressSequentially(destination, { delay: 60 });
-    await page.getByRole('option', { name: new RegExp(`^${destination}\\b`, 'u') }).click();
+    await clickFirst([page.getByRole('option', { name: new RegExp(`\\b${destination}\\b`, 'u') })], `${destination} 도착지 옵션`);
     await checkRestriction(page, blockedStatus);
-    await page.locator('#seatCalendarBtn').click();
+
+    // Month picker: renewed UI opens it from the "탑승월 가는 달" button, legacy from #seatCalendarBtn.
+    await clickFirst(
+      [page.getByRole('button', { name: /^탑승월/u }), page.locator('#seatCalendarBtn')],
+      '탑승월 선택',
+    );
     const [year, number] = month.split('-');
-    await page.getByRole('group', { name: year, exact: true }).getByRole('button', { name: `${Number(number)}월`, exact: true }).click();
-    await page.getByRole('button', { name: '선택', exact: true }).click();
+    await clickFirst(
+      [page.getByRole('group', { name: year, exact: true }).getByRole('button', { name: `${Number(number)}월`, exact: true })],
+      `${month} 월 선택`,
+    );
+    await clickFirst([page.getByRole('button', { name: '선택', exact: true })], '탑승월 확정');
     await checkRestriction(page, blockedStatus);
 
     // A single monthly search. There is no day-by-day navigation or direct API client.
@@ -152,12 +254,22 @@ export async function collectMonth(month: string, headless = false, options: Col
       (response) => new URL(response.url()).pathname === OBSERVED_RESPONSE_PATH,
       { timeout: 25_000 },
     ).then(async (response) => response.ok() ? describeResponse(await response.json()) : null).catch(() => null) : Promise.resolve(null);
-    await page.getByRole('button', { name: '조회', exact: true }).click();
-    const dialog = page.locator('[role="dialog"][aria-labelledby="modals-travelCalendar-title"]');
-    await dialog.locator('#bonusCalendarTableWrapEl tbody td[id^="day_"]').first().waitFor({ timeout: 30_000 });
+    await clickFirst([page.getByRole('button', { name: '조회', exact: true })], '조회');
+    const legacyDialog = page.locator('[role="dialog"][aria-labelledby="modals-travelCalendar-title"]');
+    await page.locator('#bonusCalendarTableWrapEl tbody td[id^="day_"]').first().waitFor({ timeout: 30_000 });
     await checkRestriction(page, blockedStatus);
-    await dialog.locator('#bonusFilterBtn').click();
-    const filter = page.getByRole('dialog', { name: '보너스 좌석 필터', exact: true });
+
+    // Every cabin filter must be shown, otherwise the calendar hides seat types.
+    await clickFirst(
+      [page.getByRole('button', { name: '좌석 필터', exact: true }), page.locator('#bonusFilterBtn')],
+      '좌석 필터',
+    );
+    const filter = page.getByRole('dialog', { name: '보너스 좌석 필터', exact: true }).or(
+      page.locator('[role="dialog"]').filter({
+        has: page.getByRole('heading', { name: '보너스 좌석 필터', exact: true }),
+      }),
+    ).first();
+    await filter.waitFor({ timeout: 15_000 });
     if (await filter.getByRole('checkbox').count() !== FILTER_LABELS.length) {
       throw new CollectionError('STRUCTURE_CHANGED', '좌석 필터 구조가 변경되었습니다.');
     }
@@ -166,19 +278,32 @@ export async function collectMonth(month: string, headless = false, options: Col
         throw new CollectionError('FILTERED_RESULT', '일부 좌석 종류가 숨겨져 있어 수집을 중단했습니다.');
       }
     }
-    await filter.getByRole('button', { name: '닫기', exact: true }).click();
-    const html = await dialog.evaluate((element) => element.outerHTML);
+    await clickFirst([filter.getByRole('button', { name: '닫기', exact: true })], '좌석 필터 닫기');
+
+    const renewed = await page.locator('#bonusCalendarTableWrapEl table.ui-flexible-date__table').count() > 0;
+    const html = renewed
+      ? await captureRenewedCalendar(page)
+      : await legacyDialog.evaluate((element) => element.outerHTML);
     const data = parseCalendarHtml(html, {
       origin, destination, month, sourceUpdatedAt, collectedAt: new Date().toISOString(),
     });
-    const screenshot = captureArtifacts ? await dialog.screenshot() : Buffer.alloc(0);
-    return { data, html: captureArtifacts ? html : '', screenshot, evidence: {
-      sourceUrl: SOURCE_URL, sourceDescription: '대한항공 공개 현황 기준',
-      loggedIn: false, persistedSessionUsed: false, method: 'MONTHLY_DOM',
-      requests, responseObservation: await responseObservation,
-      cookies: captureArtifacts ? (await context.cookies()).map(({ name, domain, httpOnly, secure, sameSite }) =>
-        ({ name, domain, httpOnly, secure, sameSite })) : [],
-    } };
+    const resultRegion = renewed
+      ? page.locator('.full-modal-dialog__main-document')
+      : legacyDialog;
+    const screenshot = captureArtifacts ? await resultRegion.first().screenshot() : Buffer.alloc(0);
+    return {
+      data,
+      html: captureArtifacts ? html : '',
+      screenshot,
+      evidence: {
+        sourceUrl: SOURCE_URL, sourceDescription: '대한항공 공개 현황 기준',
+        loggedIn: false, persistedSessionUsed: false,
+        method: renewed ? 'MONTHLY_DOM_RENEWED' : 'MONTHLY_DOM',
+        requests, responseObservation: await responseObservation,
+        cookies: captureArtifacts ? (await context.cookies()).map(({ name, domain, httpOnly, secure, sameSite }) =>
+          ({ name, domain, httpOnly, secure, sameSite })) : [],
+      },
+    };
   } catch (error) {
     await checkRestriction(page, blockedStatus);
     throw error;
